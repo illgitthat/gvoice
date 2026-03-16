@@ -46,4 +46,5 @@ type UserLoginMetadata struct {
 
 type PortalMetadata struct {
 	Participants []string `json:"participants"`
+	ThreadIDs    []string `json:"thread_ids"`
 }

@@ -22,7 +22,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +31,7 @@ import (
 	"go.mau.fi/util/exmime"
 	"google.golang.org/protobuf/proto"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
@@ -118,30 +118,99 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to list threads")
 		return
 	}
+	// Build map of phone number -> text thread ID for DM threads.
+	// This allows merging call/voicemail threads into the same portal as SMS.
+	textThreadForPhone := make(map[string]string)
+	threadsByPhone := make(map[string][]string)
+	for _, thread := range resp.Threads {
+		if len(thread.PhoneNumbers) != 1 {
+			continue
+		}
+		phone := thread.PhoneNumbers[0]
+		threadsByPhone[phone] = append(threadsByPhone[phone], thread.ID)
+		if thread.IsText {
+			textThreadForPhone[phone] = thread.ID
+		}
+	}
+	existingPortalsByThreadID := make(map[string]*database.Portal)
+	for phone := range threadsByPhone {
+		portals, err := gc.Main.Bridge.DB.Portal.GetAllDMsWith(ctx, gc.makeUserID(phone))
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("phone", phone).Msg("Failed to load DM portals while resolving merged thread mapping")
+			continue
+		}
+		for _, portal := range portals {
+			if portal == nil || (portal.Receiver != "" && portal.Receiver != gc.UserLogin.ID) {
+				continue
+			}
+			indexStoredPortalThreadIDs(portal, existingPortalsByThreadID)
+		}
+	}
+	portalThreadForSource := make(map[string]string, len(resp.Threads))
+	for phone, threadIDs := range threadsByPhone {
+		resolved := resolveMergedPortalThreadIDs(threadIDs, textThreadForPhone[phone], existingPortalsByThreadID)
+		for threadID, portalThreadID := range resolved {
+			portalThreadForSource[threadID] = portalThreadID
+		}
+	}
+	type fetchedThread struct {
+		Thread         *gvproto.Thread
+		PortalThreadID string
+		PortalKey      networkid.PortalKey
+		PrevMessageTS  time.Time
+		Known          bool
+	}
+	type resyncPortal struct {
+		PortalKey       networkid.PortalKey
+		ChatInfoThread  *gvproto.Thread
+		Threads         []*gvproto.Thread
+		LatestMessageTS time.Time
+		NeedsResync     bool
+	}
+	portalResyncs := make(map[string]*resyncPortal)
+	fetchedThreads := make([]fetchedThread, 0, len(resp.Threads))
 	for _, thread := range resp.Threads {
 		if len(thread.Messages) == 0 {
 			continue
 		}
 		lastMessageTS := time.UnixMilli(thread.Messages[0].Timestamp)
-		portalKey := gc.makePortalKey(thread.ID)
-		prevMsg, ok := gc.lastEvents[thread.ID]
-		gc.lastEvents[thread.ID] = lastMessageTS
+		portalThreadID := thread.ID
+		if resolvedThreadID, ok := portalThreadForSource[thread.ID]; ok {
+			portalThreadID = resolvedThreadID
+		}
+		portalKey := gc.makePortalKey(portalThreadID)
+		portalState, ok := portalResyncs[portalThreadID]
 		if !ok {
-			gc.Main.Bridge.QueueRemoteEvent(gc.UserLogin, &simplevent.ChatResync{
-				EventMeta: simplevent.EventMeta{
-					Type:         bridgev2.RemoteEventChatResync,
-					PortalKey:    portalKey,
-					CreatePortal: true,
-				},
-				ChatInfo:            gc.wrapChatInfo(ctx, thread),
-				LatestMessageTS:     lastMessageTS,
-				BundledBackfillData: thread,
-			})
+			portalState = &resyncPortal{PortalKey: portalKey}
+			portalResyncs[portalThreadID] = portalState
+		}
+		if portalState.ChatInfoThread == nil || thread.IsText || thread.ID == portalThreadID {
+			portalState.ChatInfoThread = thread
+		}
+		portalState.Threads = append(portalState.Threads, thread)
+		if lastMessageTS.After(portalState.LatestMessageTS) {
+			portalState.LatestMessageTS = lastMessageTS
+		}
+		prevMsg, known := gc.lastEvents[thread.ID]
+		gc.lastEvents[thread.ID] = lastMessageTS
+		if !known {
+			portalState.NeedsResync = true
+		}
+		fetchedThreads = append(fetchedThreads, fetchedThread{
+			Thread:         thread,
+			PortalThreadID: portalThreadID,
+			PortalKey:      portalKey,
+			PrevMessageTS:  prevMsg,
+			Known:          known,
+		})
+	}
+	for _, threadState := range fetchedThreads {
+		if !threadState.Known || portalResyncs[threadState.PortalThreadID].NeedsResync {
 			continue
 		}
-		for _, msg := range thread.Messages {
+		for _, msg := range threadState.Thread.Messages {
 			ts, txnID, sender := gc.getMessageMeta(msg)
-			if !ts.After(prevMsg) {
+			if !ts.After(threadState.PrevMessageTS) {
 				break
 			}
 			gc.Main.Bridge.QueueRemoteEvent(gc.UserLogin, &simplevent.Message[*gvproto.Message]{
@@ -154,7 +223,7 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 							Str("top_level_sender", msg.GetContact().GetPhoneNumber()).
 							Str("mms_sender", msg.GetMMS().GetSenderPhoneNumber())
 					},
-					PortalKey:   portalKey,
+					PortalKey:   threadState.PortalKey,
 					Sender:      sender,
 					Timestamp:   ts,
 					StreamOrder: msg.Timestamp,
@@ -166,21 +235,53 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 			})
 		}
 	}
+	for _, portalState := range portalResyncs {
+		if !portalState.NeedsResync {
+			continue
+		}
+		bundle := &gvMergedThreadBundle{Threads: portalState.Threads}
+		previousThreadIDs, err := gc.getStoredPortalThreadIDs(ctx, portalState.PortalKey)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Stringer("portal_key", portalState.PortalKey).Msg("Failed to load existing portal thread IDs before resync")
+		}
+		sourceThreadIDs := bundle.normalizedThreadIDs(string(portalState.PortalKey.ID))
+		latestMessageTS := portalState.LatestMessageTS
+		chatInfoThread := portalState.ChatInfoThread
+		portalKey := portalState.PortalKey
+		gc.Main.Bridge.QueueRemoteEvent(gc.UserLogin, &simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:         bridgev2.RemoteEventChatResync,
+				PortalKey:    portalKey,
+				CreatePortal: true,
+			},
+			ChatInfo:        gc.wrapChatInfo(ctx, chatInfoThread, sourceThreadIDs),
+			LatestMessageTS: latestMessageTS,
+			CheckNeedsBackfillFunc: func(ctx context.Context, latestMessage *database.Message) (bool, error) {
+				return mergedThreadBackfillNeeded(latestMessage, latestMessageTS, previousThreadIDs, sourceThreadIDs), nil
+			},
+			BundledBackfillData: bundle,
+		})
+	}
 }
 
-func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
-	if params.Count <= 0 {
-		return nil, fmt.Errorf("count must be positive")
+func (gc *GVClient) getStoredPortalThreadIDs(ctx context.Context, portalKey networkid.PortalKey) ([]string, error) {
+	portal, err := gc.Main.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ctx, portalKey)
+	if err != nil || portal == nil {
+		return nil, err
 	}
+	return storedPortalSourceThreadIDs(portal), nil
+}
+
+func (gc *GVClient) fetchMessagesSingleThread(ctx context.Context, params bridgev2.FetchMessagesParams, threadID string, bundledThread *gvproto.Thread) (*bridgev2.FetchMessagesResponse, error) {
 	var thread *gvproto.Thread
 	var messagesToConvert []*gvproto.Message
-	if params.BundledData != nil {
-		thread = params.BundledData.(*gvproto.Thread)
+	if bundledThread != nil {
+		thread = bundledThread
 		messagesToConvert = thread.Messages
 	}
 	if params.Forward {
 		if thread == nil {
-			resp, err := gc.Client.GetThread(ctx, string(params.Portal.ID), 100, "")
+			resp, err := gc.Client.GetThread(ctx, threadID, 100, "")
 			if err != nil {
 				return nil, fmt.Errorf("failed to fetch latest messages: %w", err)
 			}
@@ -193,11 +294,12 @@ func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 				if networkid.MessageID(msg.ID) == params.AnchorMessage.ID || !time.UnixMilli(msg.Timestamp).After(params.AnchorMessage.Timestamp) {
 					messagesToConvert = messagesToConvert[:i]
 					didCutOff = true
+					break
 				}
 			}
 		}
 		for len(messagesToConvert) < params.Count && !didCutOff && thread.PaginationToken != "" {
-			resp, err := gc.Client.GetThread(ctx, string(params.Portal.ID), 100, thread.PaginationToken)
+			resp, err := gc.Client.GetThread(ctx, threadID, 100, thread.PaginationToken)
 			if err != nil {
 				return nil, fmt.Errorf("failed to fetch messages: %w", err)
 			}
@@ -208,6 +310,7 @@ func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 					if networkid.MessageID(msg.ID) == params.AnchorMessage.ID || !time.UnixMilli(msg.Timestamp).After(params.AnchorMessage.Timestamp) {
 						messagesToConvert = messagesToConvert[:i]
 						didCutOff = true
+						break
 					}
 				}
 			}
@@ -221,7 +324,7 @@ func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 			paginationToken = strconv.FormatInt(params.AnchorMessage.Timestamp.UnixMilli(), 10)
 		}
 		for len(messagesToConvert) < params.Count && paginationToken != "" {
-			resp, err := gc.Client.GetThread(ctx, string(params.Portal.ID), 100, paginationToken)
+			resp, err := gc.Client.GetThread(ctx, threadID, 100, paginationToken)
 			if err != nil {
 				return nil, fmt.Errorf("failed to fetch messages: %w", err)
 			}
@@ -233,10 +336,135 @@ func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 			return nil, fmt.Errorf("unexpected state: no thread")
 		}
 	}
+	return &bridgev2.FetchMessagesResponse{
+		Messages: gc.convertBackfillMessages(ctx, params.Portal, sortAndDedupeGVMessages(messagesToConvert)),
+		Cursor:   networkid.PaginationCursor(thread.PaginationToken),
+		HasMore:  thread.PaginationToken != "",
+		MarkRead: thread.Read,
+	}, nil
+}
+
+func (gc *GVClient) fetchMergedMessages(ctx context.Context, params bridgev2.FetchMessagesParams, threadIDs []string, bundle *gvMergedThreadBundle) (*bridgev2.FetchMessagesResponse, error) {
+	if params.Forward {
+		type threadState struct {
+			NextToken string
+			Stopped   bool
+		}
+		states := make(map[string]*threadState, len(threadIDs))
+		for _, threadID := range threadIDs {
+			states[threadID] = &threadState{}
+		}
+		allRead := true
+		var messagesToConvert []*gvproto.Message
+		addThread := func(thread *gvproto.Thread) {
+			if thread == nil {
+				return
+			}
+			state, ok := states[thread.ID]
+			if !ok {
+				state = &threadState{}
+				states[thread.ID] = state
+			}
+			if !thread.Read {
+				allRead = false
+			}
+			filtered, hitAnchor := trimForwardGVMessages(thread.Messages, params.AnchorMessage)
+			messagesToConvert = append(messagesToConvert, filtered...)
+			state.NextToken = thread.PaginationToken
+			state.Stopped = hitAnchor || thread.PaginationToken == ""
+		}
+		for _, threadID := range threadIDs {
+			thread := bundle.getThread(threadID)
+			if thread == nil {
+				resp, err := gc.Client.GetThread(ctx, threadID, 100, "")
+				if err != nil {
+					return nil, fmt.Errorf("failed to fetch latest messages for merged thread %s: %w", threadID, err)
+				}
+				thread = resp.Thread
+			}
+			addThread(thread)
+		}
+		for len(messagesToConvert) < params.Count {
+			fetchedAny := false
+			for _, threadID := range threadIDs {
+				state := states[threadID]
+				if state == nil || state.Stopped || state.NextToken == "" {
+					continue
+				}
+				resp, err := gc.Client.GetThread(ctx, threadID, 100, state.NextToken)
+				if err != nil {
+					return nil, fmt.Errorf("failed to fetch merged thread messages for %s: %w", threadID, err)
+				}
+				addThread(resp.Thread)
+				fetchedAny = true
+			}
+			if !fetchedAny {
+				break
+			}
+		}
+		hasMore := false
+		for _, state := range states {
+			if state != nil && !state.Stopped && state.NextToken != "" {
+				hasMore = true
+				break
+			}
+		}
+		return &bridgev2.FetchMessagesResponse{
+			Messages:                gc.convertBackfillMessages(ctx, params.Portal, sortAndDedupeGVMessages(messagesToConvert)),
+			HasMore:                 hasMore,
+			MarkRead:                allRead,
+			AggressiveDeduplication: true,
+		}, nil
+	}
+	currentTokens, err := decodeGVMergedCursor(params.Cursor)
+	if err != nil {
+		currentTokens = map[string]string{string(params.Portal.ID): string(params.Cursor)}
+		if params.AnchorMessage != nil {
+			anchorToken := strconv.FormatInt(params.AnchorMessage.Timestamp.UnixMilli(), 10)
+			for _, threadID := range threadIDs {
+				if threadID != string(params.Portal.ID) {
+					currentTokens[threadID] = anchorToken
+				}
+			}
+		}
+	}
+	if len(currentTokens) == 0 {
+		if params.AnchorMessage == nil {
+			return nil, fmt.Errorf("can't backward backfill without either cursor or anchor message")
+		}
+		anchorToken := strconv.FormatInt(params.AnchorMessage.Timestamp.UnixMilli(), 10)
+		currentTokens = make(map[string]string, len(threadIDs))
+		for _, threadID := range threadIDs {
+			currentTokens[threadID] = anchorToken
+		}
+	}
+	messagesToConvert, currentTokens, err := fetchMergedBackwardMessages(ctx, threadIDs, currentTokens, params.Count, func(ctx context.Context, threadID string, fetchCount int, paginationToken string) (*gvproto.Thread, error) {
+		resp, err := gc.Client.GetThread(ctx, threadID, fetchCount, paginationToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch merged thread messages for %s: %w", threadID, err)
+		}
+		return resp.Thread, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	cursor, err := encodeGVMergedCursor(currentTokens)
+	if err != nil {
+		return nil, err
+	}
+	return &bridgev2.FetchMessagesResponse{
+		Messages:                gc.convertBackfillMessages(ctx, params.Portal, messagesToConvert),
+		Cursor:                  cursor,
+		HasMore:                 len(currentTokens) > 0,
+		AggressiveDeduplication: true,
+	}, nil
+}
+
+func (gc *GVClient) convertBackfillMessages(ctx context.Context, portal *bridgev2.Portal, messagesToConvert []*gvproto.Message) []*bridgev2.BackfillMessage {
 	convertedMessages := make([]*bridgev2.BackfillMessage, len(messagesToConvert))
 	for i, msg := range messagesToConvert {
 		ts, txnID, sender := gc.getMessageMeta(msg)
-		converted, _ := gc.convertMessage(ctx, params.Portal, gc.Main.Bridge.Bot, msg)
+		converted, _ := gc.convertMessage(ctx, portal, gc.Main.Bridge.Bot, msg)
 		convertedMessages[i] = &bridgev2.BackfillMessage{
 			ConvertedMessage: converted,
 			ID:               networkid.MessageID(msg.ID),
@@ -246,13 +474,26 @@ func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 			StreamOrder:      msg.Timestamp,
 		}
 	}
-	slices.Reverse(convertedMessages)
-	return &bridgev2.FetchMessagesResponse{
-		Messages: convertedMessages,
-		Cursor:   networkid.PaginationCursor(thread.PaginationToken),
-		HasMore:  thread.PaginationToken != "",
-		MarkRead: thread.Read,
-	}, nil
+	return convertedMessages
+}
+
+func (gc *GVClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	if params.Count <= 0 {
+		return nil, fmt.Errorf("count must be positive")
+	}
+	bundle, err := parseGVBackfillBundle(params.BundledData)
+	if err != nil {
+		return nil, err
+	}
+	threadIDs := backfillThreadIDs(params.Portal, bundle)
+	if len(threadIDs) <= 1 {
+		threadID := string(params.Portal.ID)
+		if len(threadIDs) == 1 {
+			threadID = threadIDs[0]
+		}
+		return gc.fetchMessagesSingleThread(ctx, params, threadID, bundle.getThread(threadID))
+	}
+	return gc.fetchMergedMessages(ctx, params, threadIDs, bundle)
 }
 
 func (gc *GVClient) getMessageMeta(msg *gvproto.Message) (ts time.Time, txnID networkid.TransactionID, sender bridgev2.EventSender) {
@@ -408,23 +649,35 @@ func convertGVCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 	if msg.GetText() != "" || msg.GetMMS() != nil {
 		return nil
 	}
-	var body string
-	switch msg.GetCoarseType() {
-	case gvproto.Message_CALL_TYPE_INCOMING:
-		switch msg.GetType() {
-		case gvproto.Message_INCOMING_CALL, gvproto.Message_INCOMING_CALL_CANCELLED:
-			body = "Incoming call"
-		default:
-			return nil
-		}
-	case gvproto.Message_CALL_TYPE_OUTGOING:
-		if msg.GetType() != gvproto.Message_OUTGOING_CALL {
-			return nil
-		}
-		body = "Outgoing call"
+	// Google Voice does not reliably distinguish incoming vs outgoing calls
+	// in the API (both appear as INCOMING_CALL), so we label generically.
+	switch msg.GetType() {
+	case gvproto.Message_INCOMING_CALL, gvproto.Message_INCOMING_CALL_CANCELLED, gvproto.Message_OUTGOING_CALL:
 	default:
 		return nil
 	}
+	return newGVCallConvertedMessage("Voice call")
+}
+
+func convertGVMissedCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
+	if msg.GetType() != gvproto.Message_MISSED_CALL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_MISSED {
+		return nil
+	}
+	return newGVCallConvertedMessage("Missed call")
+}
+
+func convertGVVoicemailMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
+	if msg.GetType() != gvproto.Message_VOICEMAIL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_VOICEMAIL {
+		return nil
+	}
+	body := "Voicemail"
+	if transcript := buildGVVoicemailTranscript(msg.GetTranscript()); transcript != "" {
+		body = "Voicemail: " + transcript
+	}
+	return newGVCallConvertedMessage(body)
+}
+
+func newGVCallConvertedMessage(body string) *bridgev2.ConvertedMessage {
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
@@ -435,44 +688,6 @@ func convertGVCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 					Type:     event.BeeperActionMessageCall,
 					CallType: event.BeeperActionMessageCallTypeVoice,
 				},
-			},
-		}},
-	}
-}
-
-func convertGVMissedCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
-	if msg.GetType() != gvproto.Message_MISSED_CALL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_MISSED {
-		return nil
-	}
-	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    "Missed call",
-				BeeperActionMessage: &event.BeeperActionMessage{
-					Type:     event.BeeperActionMessageCall,
-					CallType: event.BeeperActionMessageCallTypeVoice,
-				},
-			},
-		}},
-	}
-}
-
-func convertGVVoicemailMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
-	if msg.GetType() != gvproto.Message_VOICEMAIL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_VOICEMAIL {
-		return nil
-	}
-	transcript := buildGVVoicemailTranscript(msg.GetTranscript())
-	if transcript == "" {
-		return nil
-	}
-	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    "Voicemail: " + transcript,
 			},
 		}},
 	}

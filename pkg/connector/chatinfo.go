@@ -58,7 +58,7 @@ func (gc *GVClient) makeUserID(e164 string) networkid.UserID {
 	return networkid.UserID(fmt.Sprintf("%s.%s", gc.UserLogin.Metadata.(*UserLoginMetadata).Prefix, e164))
 }
 
-func (gc *GVClient) wrapChatInfo(ctx context.Context, info *gvproto.Thread) *bridgev2.ChatInfo {
+func (gc *GVClient) wrapChatInfo(ctx context.Context, info *gvproto.Thread, sourceThreadIDs []string) *bridgev2.ChatInfo {
 	var wrapped bridgev2.ChatInfo
 	wrapped.Members = &bridgev2.ChatMemberList{
 		IsFull:           true,
@@ -91,13 +91,20 @@ func (gc *GVClient) wrapChatInfo(ctx context.Context, info *gvproto.Thread) *bri
 		}
 	}
 	wrapped.ExtraUpdates = func(ctx context.Context, portal *bridgev2.Portal) bool {
-		slices.Sort(info.PhoneNumbers)
+		participants := append([]string(nil), info.PhoneNumbers...)
+		slices.Sort(participants)
+		threadIDs := normalizeSourceThreadIDs(string(portal.ID), sourceThreadIDs)
 		meta := portal.Metadata.(*PortalMetadata)
-		if !slices.Equal(info.PhoneNumbers, meta.Participants) {
-			meta.Participants = info.PhoneNumbers
-			return true
+		changed := false
+		if !slices.Equal(participants, meta.Participants) {
+			meta.Participants = participants
+			changed = true
 		}
-		return false
+		if !slices.Equal(threadIDs, meta.ThreadIDs) {
+			meta.ThreadIDs = threadIDs
+			changed = true
+		}
+		return changed
 	}
 	return &wrapped
 }
