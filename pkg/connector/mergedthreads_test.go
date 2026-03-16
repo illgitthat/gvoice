@@ -149,7 +149,7 @@ func TestResolveMergedPortalThreadIDsReusesSingleExistingRoom(t *testing.T) {
 	}
 }
 
-func TestResolveMergedPortalThreadIDsKeepsMultipleExistingRoomsSplit(t *testing.T) {
+func TestResolveMergedPortalThreadIDsMergesMultipleExistingRooms(t *testing.T) {
 	resolved := resolveMergedPortalThreadIDs(
 		[]string{"call-thread", "voicemail-thread", "sms-thread"},
 		"sms-thread",
@@ -165,7 +165,7 @@ func TestResolveMergedPortalThreadIDsKeepsMultipleExistingRoomsSplit(t *testing.
 		},
 	)
 	expected := map[string]string{
-		"call-thread":      "call-thread",
+		"call-thread":      "sms-thread",
 		"voicemail-thread": "sms-thread",
 		"sms-thread":       "sms-thread",
 	}

@@ -319,11 +319,7 @@ func resolveMergedPortalThreadIDs(threadIDs []string, textThreadID string, porta
 			}
 		}
 		for _, threadID := range orderedThreadIDs {
-			if _, ok := existingRoomSet[threadID]; ok {
-				resolved[threadID] = threadID
-			} else {
-				resolved[threadID] = canonicalForNew
-			}
+			resolved[threadID] = canonicalForNew
 		}
 	}
 	return resolved
