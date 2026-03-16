@@ -665,38 +665,14 @@ func convertGVCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 	default:
 		return nil
 	}
-	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    "Voice call",
-				BeeperActionMessage: &event.BeeperActionMessage{
-					Type:     event.BeeperActionMessageCall,
-					CallType: event.BeeperActionMessageCallTypeVoice,
-				},
-			},
-		}},
-	}
+	return newGVCallConvertedMessage("Voice call")
 }
 
 func convertGVMissedCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 	if msg.GetType() != gvproto.Message_MISSED_CALL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_MISSED {
 		return nil
 	}
-	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    "Missed call",
-				BeeperActionMessage: &event.BeeperActionMessage{
-					Type:     event.BeeperActionMessageCall,
-					CallType: event.BeeperActionMessageCallTypeVoice,
-				},
-			},
-		}},
-	}
+	return newGVCallConvertedMessage("Missed call")
 }
 
 func convertGVVoicemailMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
@@ -707,12 +683,20 @@ func convertGVVoicemailMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage 
 	if transcript := buildGVVoicemailTranscript(msg.GetTranscript()); transcript != "" {
 		body = "Voicemail: " + transcript
 	}
+	return newGVCallConvertedMessage(body)
+}
+
+func newGVCallConvertedMessage(body string) *bridgev2.ConvertedMessage {
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
 				MsgType: event.MsgText,
 				Body:    body,
+				BeeperActionMessage: &event.BeeperActionMessage{
+					Type:     event.BeeperActionMessageCall,
+					CallType: event.BeeperActionMessageCallTypeVoice,
+				},
 			},
 		}},
 	}
