@@ -17,9 +17,11 @@
 package connector
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -183,6 +185,21 @@ func decodeGVMergedCursor(cursor networkid.PaginationCursor) (map[string]string,
 	return tokens, nil
 }
 
+func compareGVMessages(a, b *gvproto.Message) int {
+	switch {
+	case a.Timestamp < b.Timestamp:
+		return -1
+	case a.Timestamp > b.Timestamp:
+		return 1
+	case a.ID < b.ID:
+		return -1
+	case a.ID > b.ID:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func sortAndDedupeGVMessages(messages []*gvproto.Message) []*gvproto.Message {
 	seen := make(map[string]struct{}, len(messages))
 	filtered := messages[:0]
@@ -196,20 +213,7 @@ func sortAndDedupeGVMessages(messages []*gvproto.Message) []*gvproto.Message {
 		seen[msg.ID] = struct{}{}
 		filtered = append(filtered, msg)
 	}
-	slices.SortFunc(filtered, func(a, b *gvproto.Message) int {
-		switch {
-		case a.Timestamp < b.Timestamp:
-			return -1
-		case a.Timestamp > b.Timestamp:
-			return 1
-		case a.ID < b.ID:
-			return -1
-		case a.ID > b.ID:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortFunc(filtered, compareGVMessages)
 	return filtered
 }
 
@@ -223,6 +227,112 @@ func trimForwardGVMessages(messages []*gvproto.Message, anchor *database.Message
 		}
 	}
 	return messages, false
+}
+
+type gvMergedBackwardFetcher func(context.Context, string, int, string) (*gvproto.Thread, error)
+
+type gvMergedBackwardThreadState struct {
+	FetchToken string
+	Page       []*gvproto.Message
+	PageIndex  int
+	Loaded     bool
+}
+
+func (state *gvMergedBackwardThreadState) currentMessage() *gvproto.Message {
+	for state.PageIndex < len(state.Page) && state.Page[state.PageIndex] == nil {
+		state.PageIndex++
+	}
+	if state.PageIndex >= len(state.Page) {
+		return nil
+	}
+	return state.Page[state.PageIndex]
+}
+
+func (state *gvMergedBackwardThreadState) ensureCandidate(ctx context.Context, threadID string, remaining int, fetchPage gvMergedBackwardFetcher) error {
+	for state.currentMessage() == nil && state.FetchToken != "" {
+		fetchCount := 1
+		if state.Loaded {
+			fetchCount = remaining
+			if fetchCount < 1 {
+				fetchCount = 1
+			} else if fetchCount > 100 {
+				fetchCount = 100
+			}
+		}
+		thread, err := fetchPage(ctx, threadID, fetchCount, state.FetchToken)
+		if err != nil {
+			return err
+		}
+		state.Loaded = true
+		state.Page = thread.Messages
+		state.PageIndex = 0
+		state.FetchToken = thread.PaginationToken
+	}
+	return nil
+}
+
+func (state *gvMergedBackwardThreadState) hasMore() bool {
+	return state.currentMessage() != nil || state.FetchToken != ""
+}
+
+func fetchMergedBackwardMessages(ctx context.Context, threadIDs []string, currentTokens map[string]string, count int, fetchPage gvMergedBackwardFetcher) ([]*gvproto.Message, map[string]string, error) {
+	if count <= 0 || len(threadIDs) == 0 || len(currentTokens) == 0 {
+		return nil, nil, nil
+	}
+	states := make(map[string]*gvMergedBackwardThreadState, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if token := currentTokens[threadID]; token != "" {
+			states[threadID] = &gvMergedBackwardThreadState{FetchToken: token}
+		}
+	}
+	selected := make([]*gvproto.Message, 0, count)
+	seen := make(map[string]struct{}, count)
+	for len(selected) < count {
+		remaining := count - len(selected)
+		var (
+			bestMessage  *gvproto.Message
+			bestThreadID string
+		)
+		for _, threadID := range threadIDs {
+			state := states[threadID]
+			if state == nil {
+				continue
+			}
+			if err := state.ensureCandidate(ctx, threadID, remaining, fetchPage); err != nil {
+				return nil, nil, err
+			}
+			msg := state.currentMessage()
+			if msg == nil {
+				continue
+			}
+			if bestMessage == nil || compareGVMessages(msg, bestMessage) > 0 {
+				bestMessage = msg
+				bestThreadID = threadID
+			}
+		}
+		if bestMessage == nil {
+			break
+		}
+		states[bestThreadID].PageIndex++
+		if _, alreadySeen := seen[bestMessage.ID]; alreadySeen {
+			continue
+		}
+		seen[bestMessage.ID] = struct{}{}
+		selected = append(selected, bestMessage)
+	}
+	if len(selected) == 0 {
+		return nil, nil, nil
+	}
+	cutoffToken := strconv.FormatInt(selected[len(selected)-1].Timestamp, 10)
+	nextTokens := make(map[string]string, len(states))
+	for _, threadID := range threadIDs {
+		state := states[threadID]
+		if state != nil && state.hasMore() {
+			nextTokens[threadID] = cutoffToken
+		}
+	}
+	slices.Reverse(selected)
+	return selected, nextTokens, nil
 }
 
 func mergedThreadBackfillNeeded(latestMessage *database.Message, latestMessageTS time.Time, previousThreadIDs, currentThreadIDs []string) bool {

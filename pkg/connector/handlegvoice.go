@@ -438,31 +438,22 @@ func (gc *GVClient) fetchMergedMessages(ctx context.Context, params bridgev2.Fet
 			currentTokens[threadID] = anchorToken
 		}
 	}
-	var messagesToConvert []*gvproto.Message
-	for len(messagesToConvert) < params.Count && len(currentTokens) > 0 {
-		nextTokens := make(map[string]string, len(currentTokens))
-		for _, threadID := range threadIDs {
-			paginationToken := currentTokens[threadID]
-			if paginationToken == "" {
-				continue
-			}
-			resp, err := gc.Client.GetThread(ctx, threadID, 100, paginationToken)
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch merged thread messages for %s: %w", threadID, err)
-			}
-			messagesToConvert = append(messagesToConvert, resp.Thread.Messages...)
-			if resp.Thread.PaginationToken != "" {
-				nextTokens[threadID] = resp.Thread.PaginationToken
-			}
+	messagesToConvert, currentTokens, err := fetchMergedBackwardMessages(ctx, threadIDs, currentTokens, params.Count, func(ctx context.Context, threadID string, fetchCount int, paginationToken string) (*gvproto.Thread, error) {
+		resp, err := gc.Client.GetThread(ctx, threadID, fetchCount, paginationToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch merged thread messages for %s: %w", threadID, err)
 		}
-		currentTokens = nextTokens
+		return resp.Thread, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	cursor, err := encodeGVMergedCursor(currentTokens)
 	if err != nil {
 		return nil, err
 	}
 	return &bridgev2.FetchMessagesResponse{
-		Messages:                gc.convertBackfillMessages(ctx, params.Portal, sortAndDedupeGVMessages(messagesToConvert)),
+		Messages:                gc.convertBackfillMessages(ctx, params.Portal, messagesToConvert),
 		Cursor:                  cursor,
 		HasMore:                 len(currentTokens) > 0,
 		AggressiveDeduplication: true,
