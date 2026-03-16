@@ -118,12 +118,27 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to list threads")
 		return
 	}
+	// Build map of phone number -> text thread ID for DM threads.
+	// This allows merging call/voicemail threads into the same portal as SMS.
+	textThreadForPhone := make(map[string]string)
+	for _, thread := range resp.Threads {
+		if thread.IsText && len(thread.PhoneNumbers) == 1 {
+			textThreadForPhone[thread.PhoneNumbers[0]] = thread.ID
+		}
+	}
 	for _, thread := range resp.Threads {
 		if len(thread.Messages) == 0 {
 			continue
 		}
 		lastMessageTS := time.UnixMilli(thread.Messages[0].Timestamp)
 		portalKey := gc.makePortalKey(thread.ID)
+		// For DM call/voicemail threads, redirect to the text thread portal
+		// so calls and texts from the same contact appear in one room.
+		if !thread.IsText && len(thread.PhoneNumbers) == 1 {
+			if textThreadID, ok := textThreadForPhone[thread.PhoneNumbers[0]]; ok {
+				portalKey = gc.makePortalKey(textThreadID)
+			}
+		}
 		prevMsg, ok := gc.lastEvents[thread.ID]
 		gc.lastEvents[thread.ID] = lastMessageTS
 		if !ok {
@@ -408,20 +423,10 @@ func convertGVCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 	if msg.GetText() != "" || msg.GetMMS() != nil {
 		return nil
 	}
-	var body string
-	switch msg.GetCoarseType() {
-	case gvproto.Message_CALL_TYPE_INCOMING:
-		switch msg.GetType() {
-		case gvproto.Message_INCOMING_CALL, gvproto.Message_INCOMING_CALL_CANCELLED:
-			body = "Incoming call"
-		default:
-			return nil
-		}
-	case gvproto.Message_CALL_TYPE_OUTGOING:
-		if msg.GetType() != gvproto.Message_OUTGOING_CALL {
-			return nil
-		}
-		body = "Outgoing call"
+	// Google Voice does not reliably distinguish incoming vs outgoing calls
+	// in the API (both appear as INCOMING_CALL), so we label generically.
+	switch msg.GetType() {
+	case gvproto.Message_INCOMING_CALL, gvproto.Message_INCOMING_CALL_CANCELLED, gvproto.Message_OUTGOING_CALL:
 	default:
 		return nil
 	}
@@ -430,7 +435,7 @@ func convertGVCallMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage {
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
 				MsgType: event.MsgText,
-				Body:    body,
+				Body:    "Voice call",
 				BeeperActionMessage: &event.BeeperActionMessage{
 					Type:     event.BeeperActionMessageCall,
 					CallType: event.BeeperActionMessageCallTypeVoice,
@@ -463,16 +468,16 @@ func convertGVVoicemailMessage(msg *gvproto.Message) *bridgev2.ConvertedMessage 
 	if msg.GetType() != gvproto.Message_VOICEMAIL || msg.GetCoarseType() != gvproto.Message_CALL_TYPE_VOICEMAIL {
 		return nil
 	}
-	transcript := buildGVVoicemailTranscript(msg.GetTranscript())
-	if transcript == "" {
-		return nil
+	body := "Voicemail"
+	if transcript := buildGVVoicemailTranscript(msg.GetTranscript()); transcript != "" {
+		body = "Voicemail: " + transcript
 	}
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
 				MsgType: event.MsgText,
-				Body:    "Voicemail: " + transcript,
+				Body:    body,
 			},
 		}},
 	}
