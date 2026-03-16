@@ -272,6 +272,18 @@ func orderedUniqueThreadIDs(threadIDs []string) []string {
 	return ordered
 }
 
+func indexStoredPortalThreadIDs(portal *database.Portal, portalsByThreadID map[string]*database.Portal) {
+	if portal == nil || portalsByThreadID == nil {
+		return
+	}
+	for _, threadID := range storedPortalSourceThreadIDs(portal) {
+		if _, ok := portalsByThreadID[threadID]; ok {
+			continue
+		}
+		portalsByThreadID[threadID] = portal
+	}
+}
+
 func resolveMergedPortalThreadIDs(threadIDs []string, textThreadID string, portals map[string]*database.Portal) map[string]string {
 	orderedThreadIDs := orderedUniqueThreadIDs(threadIDs)
 	if len(orderedThreadIDs) == 0 {
@@ -282,15 +294,23 @@ func resolveMergedPortalThreadIDs(threadIDs []string, textThreadID string, porta
 	firstExistingPortal := ""
 	existingRoomSet := make(map[string]struct{}, len(orderedThreadIDs))
 	for _, threadID := range orderedThreadIDs {
-		if portals[threadID] == nil {
+		portal := portals[threadID]
+		if portal == nil {
 			continue
 		}
-		if firstExistingPortal == "" {
-			firstExistingPortal = threadID
+		portalID := string(portal.ID)
+		if portalID == "" {
+			portalID = threadID
 		}
-		if portals[threadID].MXID != "" {
-			existingRooms = append(existingRooms, threadID)
-			existingRoomSet[threadID] = struct{}{}
+		if firstExistingPortal == "" {
+			firstExistingPortal = portalID
+		}
+		if portal.MXID != "" {
+			if _, ok := existingRoomSet[portalID]; ok {
+				continue
+			}
+			existingRooms = append(existingRooms, portalID)
+			existingRoomSet[portalID] = struct{}{}
 		}
 	}
 	switch len(existingRooms) {

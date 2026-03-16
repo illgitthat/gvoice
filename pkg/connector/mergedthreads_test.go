@@ -149,6 +149,32 @@ func TestResolveMergedPortalThreadIDsReusesSingleExistingRoom(t *testing.T) {
 	}
 }
 
+func TestResolveMergedPortalThreadIDsReusesMergedRoomWhenOnlySecondaryThreadIsKnown(t *testing.T) {
+	mergedPortal := &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "sms-thread"},
+		MXID:      id.RoomID("!sms:example.com"),
+		Metadata: &PortalMetadata{
+			ThreadIDs: []string{"sms-thread", "call-thread"},
+		},
+	}
+	portalsByThreadID := make(map[string]*database.Portal)
+	indexStoredPortalThreadIDs(mergedPortal, portalsByThreadID)
+
+	resolved := resolveMergedPortalThreadIDs(
+		[]string{"call-thread"},
+		"",
+		portalsByThreadID,
+	)
+	expected := map[string]string{
+		"call-thread": "sms-thread",
+	}
+	for threadID, portalThreadID := range expected {
+		if resolved[threadID] != portalThreadID {
+			t.Fatalf("unexpected canonical thread for %s: got %q want %q", threadID, resolved[threadID], portalThreadID)
+		}
+	}
+}
+
 func TestResolveMergedPortalThreadIDsMergesMultipleExistingRooms(t *testing.T) {
 	resolved := resolveMergedPortalThreadIDs(
 		[]string{"call-thread", "voicemail-thread", "sms-thread"},

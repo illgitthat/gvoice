@@ -140,7 +140,20 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 				zerolog.Ctx(ctx).Err(err).Str("thread_id", threadID).Msg("Failed to load portal while resolving merged thread mapping")
 				continue
 			}
-			existingPortalsByThreadID[threadID] = portal
+			indexStoredPortalThreadIDs(portal, existingPortalsByThreadID)
+		}
+	}
+	for phone := range threadsByPhone {
+		portals, err := gc.Main.Bridge.DB.Portal.GetAllDMsWith(ctx, gc.makeUserID(phone))
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("phone", phone).Msg("Failed to load DM portals while resolving merged thread mapping")
+			continue
+		}
+		for _, portal := range portals {
+			if portal == nil || (portal.Receiver != "" && portal.Receiver != gc.UserLogin.ID) {
+				continue
+			}
+			indexStoredPortalThreadIDs(portal, existingPortalsByThreadID)
 		}
 	}
 	portalThreadForSource := make(map[string]string, len(resp.Threads))
