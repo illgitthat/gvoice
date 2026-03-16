@@ -31,6 +31,7 @@ import (
 	"go.mau.fi/util/exmime"
 	"google.golang.org/protobuf/proto"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
@@ -214,18 +215,36 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 			continue
 		}
 		bundle := &gvMergedThreadBundle{Threads: portalState.Threads}
+		previousThreadIDs, err := gc.getStoredPortalThreadIDs(ctx, portalState.PortalKey)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Stringer("portal_key", portalState.PortalKey).Msg("Failed to load existing portal thread IDs before resync")
+		}
 		sourceThreadIDs := bundle.normalizedThreadIDs(string(portalState.PortalKey.ID))
+		latestMessageTS := portalState.LatestMessageTS
+		chatInfoThread := portalState.ChatInfoThread
+		portalKey := portalState.PortalKey
 		gc.Main.Bridge.QueueRemoteEvent(gc.UserLogin, &simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
-				PortalKey:    portalState.PortalKey,
+				PortalKey:    portalKey,
 				CreatePortal: true,
 			},
-			ChatInfo:            gc.wrapChatInfo(ctx, portalState.ChatInfoThread, sourceThreadIDs),
-			LatestMessageTS:     portalState.LatestMessageTS,
+			ChatInfo:        gc.wrapChatInfo(ctx, chatInfoThread, sourceThreadIDs),
+			LatestMessageTS: latestMessageTS,
+			CheckNeedsBackfillFunc: func(ctx context.Context, latestMessage *database.Message) (bool, error) {
+				return mergedThreadBackfillNeeded(latestMessage, latestMessageTS, previousThreadIDs, sourceThreadIDs), nil
+			},
 			BundledBackfillData: bundle,
 		})
 	}
+}
+
+func (gc *GVClient) getStoredPortalThreadIDs(ctx context.Context, portalKey networkid.PortalKey) ([]string, error) {
+	portal, err := gc.Main.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ctx, portalKey)
+	if err != nil || portal == nil {
+		return nil, err
+	}
+	return storedPortalSourceThreadIDs(portal), nil
 }
 
 func (gc *GVClient) fetchMessagesSingleThread(ctx context.Context, params bridgev2.FetchMessagesParams, threadID string, bundledThread *gvproto.Thread) (*bridgev2.FetchMessagesResponse, error) {

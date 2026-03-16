@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -110,10 +111,22 @@ func portalSourceThreadIDs(portal *bridgev2.Portal) []string {
 		return nil
 	}
 	meta, _ := portal.Metadata.(*PortalMetadata)
-	if meta == nil || len(meta.ThreadIDs) == 0 {
-		return normalizeSourceThreadIDs(string(portal.ID), nil)
+	return portalSourceThreadIDsFromMetadata(string(portal.ID), meta)
+}
+
+func storedPortalSourceThreadIDs(portal *database.Portal) []string {
+	if portal == nil {
+		return nil
 	}
-	return normalizeSourceThreadIDs(string(portal.ID), meta.ThreadIDs)
+	meta, _ := portal.Metadata.(*PortalMetadata)
+	return portalSourceThreadIDsFromMetadata(string(portal.ID), meta)
+}
+
+func portalSourceThreadIDsFromMetadata(canonicalID string, meta *PortalMetadata) []string {
+	if meta == nil || len(meta.ThreadIDs) == 0 {
+		return normalizeSourceThreadIDs(canonicalID, nil)
+	}
+	return normalizeSourceThreadIDs(canonicalID, meta.ThreadIDs)
 }
 
 func backfillThreadIDs(portal *bridgev2.Portal, bundle *gvMergedThreadBundle) []string {
@@ -210,4 +223,32 @@ func trimForwardGVMessages(messages []*gvproto.Message, anchor *database.Message
 		}
 	}
 	return messages, false
+}
+
+func mergedThreadBackfillNeeded(latestMessage *database.Message, latestMessageTS time.Time, previousThreadIDs, currentThreadIDs []string) bool {
+	if !sameThreadIDSet(previousThreadIDs, currentThreadIDs) {
+		return true
+	}
+	if latestMessage == nil {
+		return !latestMessageTS.IsZero()
+	}
+	return latestMessageTS.After(latestMessage.Timestamp)
+}
+
+func sameThreadIDSet(a, b []string) bool {
+	return slices.Equal(normalizeThreadIDSet(a), normalizeThreadIDSet(b))
+}
+
+func normalizeThreadIDSet(threadIDs []string) []string {
+	if len(threadIDs) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if threadID != "" {
+			normalized = append(normalized, threadID)
+		}
+	}
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
 }
