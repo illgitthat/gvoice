@@ -6,6 +6,7 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-gvoice/pkg/libgv/gvproto"
 )
@@ -103,5 +104,74 @@ func TestMergedThreadBackfillNeededFallsBackToTimestamp(t *testing.T) {
 	}
 	if mergedThreadBackfillNeeded(latestMessage, time.UnixMilli(1000), []string{"sms-thread"}, []string{"sms-thread"}) {
 		t.Fatal("expected unchanged thread set with older timestamp to skip backfill")
+	}
+}
+
+func TestResolveMergedPortalThreadIDsPrefersTextThreadWhenNoExistingRooms(t *testing.T) {
+	resolved := resolveMergedPortalThreadIDs(
+		[]string{"call-thread", "sms-thread"},
+		"sms-thread",
+		nil,
+	)
+	expected := map[string]string{
+		"call-thread": "sms-thread",
+		"sms-thread":  "sms-thread",
+	}
+	if len(resolved) != len(expected) {
+		t.Fatalf("unexpected resolution size: got %d want %d", len(resolved), len(expected))
+	}
+	for threadID, portalThreadID := range expected {
+		if resolved[threadID] != portalThreadID {
+			t.Fatalf("unexpected canonical thread for %s: got %q want %q", threadID, resolved[threadID], portalThreadID)
+		}
+	}
+}
+
+func TestResolveMergedPortalThreadIDsReusesSingleExistingRoom(t *testing.T) {
+	resolved := resolveMergedPortalThreadIDs(
+		[]string{"call-thread", "sms-thread"},
+		"sms-thread",
+		map[string]*database.Portal{
+			"call-thread": {
+				PortalKey: networkid.PortalKey{ID: "call-thread"},
+				MXID:      "!call:example.com",
+			},
+		},
+	)
+	expected := map[string]string{
+		"call-thread": "call-thread",
+		"sms-thread":  "call-thread",
+	}
+	for threadID, portalThreadID := range expected {
+		if resolved[threadID] != portalThreadID {
+			t.Fatalf("unexpected canonical thread for %s: got %q want %q", threadID, resolved[threadID], portalThreadID)
+		}
+	}
+}
+
+func TestResolveMergedPortalThreadIDsKeepsMultipleExistingRoomsSplit(t *testing.T) {
+	resolved := resolveMergedPortalThreadIDs(
+		[]string{"call-thread", "voicemail-thread", "sms-thread"},
+		"sms-thread",
+		map[string]*database.Portal{
+			"call-thread": {
+				PortalKey: networkid.PortalKey{ID: "call-thread"},
+				MXID:      id.RoomID("!call:example.com"),
+			},
+			"sms-thread": {
+				PortalKey: networkid.PortalKey{ID: "sms-thread"},
+				MXID:      id.RoomID("!sms:example.com"),
+			},
+		},
+	)
+	expected := map[string]string{
+		"call-thread":      "call-thread",
+		"voicemail-thread": "sms-thread",
+		"sms-thread":       "sms-thread",
+	}
+	for threadID, portalThreadID := range expected {
+		if resolved[threadID] != portalThreadID {
+			t.Fatalf("unexpected canonical thread for %s: got %q want %q", threadID, resolved[threadID], portalThreadID)
+		}
 	}
 }

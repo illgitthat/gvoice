@@ -129,21 +129,33 @@ func (gc *GVClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 }
 
 func (gc *GVClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixReadReceipt) error {
-	resp, err := gc.Client.UpdateThreadAttributes(ctx, &gvproto.ReqUpdateAttributes{
-		Attributes: &gvproto.ThreadAttributes{
-			ThreadID: string(msg.Portal.ID),
-			Read:     true,
-		},
-		OtherAttributes: &gvproto.ThreadAttributes{
-			Read: true,
-		},
-		UnknownInt: 1,
-	})
-	zerolog.Ctx(ctx).Trace().Any("resp", resp).Msg("Update attributes response")
-	return err
+	var errs []error
+	for _, threadID := range portalSourceThreadIDs(msg.Portal) {
+		resp, err := gc.Client.UpdateThreadAttributes(ctx, &gvproto.ReqUpdateAttributes{
+			Attributes: &gvproto.ThreadAttributes{
+				ThreadID: threadID,
+				Read:     true,
+			},
+			OtherAttributes: &gvproto.ThreadAttributes{
+				Read: true,
+			},
+			UnknownInt: 1,
+		})
+		zerolog.Ctx(ctx).Trace().Str("thread_id", threadID).Any("resp", resp).Msg("Update attributes response")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to mark thread %s read: %w", threadID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (gc *GVClient) HandleMatrixDeleteChat(ctx context.Context, chat *bridgev2.MatrixDeleteChat) error {
-	_, err := gc.Client.DeleteThread(ctx, string(chat.Portal.ID))
-	return err
+	var errs []error
+	for _, threadID := range portalSourceThreadIDs(chat.Portal) {
+		_, err := gc.Client.DeleteThread(ctx, threadID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to delete thread %s: %w", threadID, err))
+		}
+	}
+	return errors.Join(errs...)
 }

@@ -121,9 +121,33 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 	// Build map of phone number -> text thread ID for DM threads.
 	// This allows merging call/voicemail threads into the same portal as SMS.
 	textThreadForPhone := make(map[string]string)
+	threadsByPhone := make(map[string][]string)
 	for _, thread := range resp.Threads {
-		if thread.IsText && len(thread.PhoneNumbers) == 1 {
-			textThreadForPhone[thread.PhoneNumbers[0]] = thread.ID
+		if len(thread.PhoneNumbers) != 1 {
+			continue
+		}
+		phone := thread.PhoneNumbers[0]
+		threadsByPhone[phone] = append(threadsByPhone[phone], thread.ID)
+		if thread.IsText {
+			textThreadForPhone[phone] = thread.ID
+		}
+	}
+	existingPortalsByThreadID := make(map[string]*database.Portal)
+	for _, threadIDs := range threadsByPhone {
+		for _, threadID := range orderedUniqueThreadIDs(threadIDs) {
+			portal, err := gc.Main.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ctx, gc.makePortalKey(threadID))
+			if err != nil {
+				zerolog.Ctx(ctx).Err(err).Str("thread_id", threadID).Msg("Failed to load portal while resolving merged thread mapping")
+				continue
+			}
+			existingPortalsByThreadID[threadID] = portal
+		}
+	}
+	portalThreadForSource := make(map[string]string, len(resp.Threads))
+	for phone, threadIDs := range threadsByPhone {
+		resolved := resolveMergedPortalThreadIDs(threadIDs, textThreadForPhone[phone], existingPortalsByThreadID)
+		for threadID, portalThreadID := range resolved {
+			portalThreadForSource[threadID] = portalThreadID
 		}
 	}
 	type fetchedThread struct {
@@ -148,10 +172,8 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 		}
 		lastMessageTS := time.UnixMilli(thread.Messages[0].Timestamp)
 		portalThreadID := thread.ID
-		if !thread.IsText && len(thread.PhoneNumbers) == 1 {
-			if textThreadID, ok := textThreadForPhone[thread.PhoneNumbers[0]]; ok {
-				portalThreadID = textThreadID
-			}
+		if resolvedThreadID, ok := portalThreadForSource[thread.ID]; ok {
+			portalThreadID = resolvedThreadID
 		}
 		portalKey := gc.makePortalKey(portalThreadID)
 		portalState, ok := portalResyncs[portalThreadID]
@@ -159,7 +181,7 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 			portalState = &resyncPortal{PortalKey: portalKey}
 			portalResyncs[portalThreadID] = portalState
 		}
-		if portalState.ChatInfoThread == nil || thread.ID == portalThreadID {
+		if portalState.ChatInfoThread == nil || thread.IsText || thread.ID == portalThreadID {
 			portalState.ChatInfoThread = thread
 		}
 		portalState.Threads = append(portalState.Threads, thread)

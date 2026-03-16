@@ -252,3 +252,79 @@ func normalizeThreadIDSet(threadIDs []string) []string {
 	slices.Sort(normalized)
 	return slices.Compact(normalized)
 }
+
+func orderedUniqueThreadIDs(threadIDs []string) []string {
+	if len(threadIDs) == 0 {
+		return nil
+	}
+	ordered := make([]string, 0, len(threadIDs))
+	seen := make(map[string]struct{}, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if threadID == "" {
+			continue
+		}
+		if _, ok := seen[threadID]; ok {
+			continue
+		}
+		seen[threadID] = struct{}{}
+		ordered = append(ordered, threadID)
+	}
+	return ordered
+}
+
+func resolveMergedPortalThreadIDs(threadIDs []string, textThreadID string, portals map[string]*database.Portal) map[string]string {
+	orderedThreadIDs := orderedUniqueThreadIDs(threadIDs)
+	if len(orderedThreadIDs) == 0 {
+		return nil
+	}
+	resolved := make(map[string]string, len(orderedThreadIDs))
+	existingRooms := make([]string, 0, len(orderedThreadIDs))
+	firstExistingPortal := ""
+	existingRoomSet := make(map[string]struct{}, len(orderedThreadIDs))
+	for _, threadID := range orderedThreadIDs {
+		if portals[threadID] == nil {
+			continue
+		}
+		if firstExistingPortal == "" {
+			firstExistingPortal = threadID
+		}
+		if portals[threadID].MXID != "" {
+			existingRooms = append(existingRooms, threadID)
+			existingRoomSet[threadID] = struct{}{}
+		}
+	}
+	switch len(existingRooms) {
+	case 0:
+		canonical := textThreadID
+		if canonical == "" {
+			if firstExistingPortal != "" {
+				canonical = firstExistingPortal
+			} else {
+				canonical = orderedThreadIDs[0]
+			}
+		}
+		for _, threadID := range orderedThreadIDs {
+			resolved[threadID] = canonical
+		}
+	case 1:
+		canonical := existingRooms[0]
+		for _, threadID := range orderedThreadIDs {
+			resolved[threadID] = canonical
+		}
+	default:
+		canonicalForNew := existingRooms[0]
+		if textThreadID != "" {
+			if _, ok := existingRoomSet[textThreadID]; ok {
+				canonicalForNew = textThreadID
+			}
+		}
+		for _, threadID := range orderedThreadIDs {
+			if _, ok := existingRoomSet[threadID]; ok {
+				resolved[threadID] = threadID
+			} else {
+				resolved[threadID] = canonicalForNew
+			}
+		}
+	}
+	return resolved
+}
