@@ -133,16 +133,6 @@ func (gc *GVClient) fetchNewMessages(ctx context.Context) {
 		}
 	}
 	existingPortalsByThreadID := make(map[string]*database.Portal)
-	for _, threadIDs := range threadsByPhone {
-		for _, threadID := range orderedUniqueThreadIDs(threadIDs) {
-			portal, err := gc.Main.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ctx, gc.makePortalKey(threadID))
-			if err != nil {
-				zerolog.Ctx(ctx).Err(err).Str("thread_id", threadID).Msg("Failed to load portal while resolving merged thread mapping")
-				continue
-			}
-			indexStoredPortalThreadIDs(portal, existingPortalsByThreadID)
-		}
-	}
 	for phone := range threadsByPhone {
 		portals, err := gc.Main.Bridge.DB.Portal.GetAllDMsWith(ctx, gc.makeUserID(phone))
 		if err != nil {
@@ -428,9 +418,6 @@ func (gc *GVClient) fetchMergedMessages(ctx context.Context, params bridgev2.Fet
 	}
 	currentTokens, err := decodeGVMergedCursor(params.Cursor)
 	if err != nil {
-		if params.Cursor == "" {
-			return nil, err
-		}
 		currentTokens = map[string]string{string(params.Portal.ID): string(params.Cursor)}
 		if params.AnchorMessage != nil {
 			anchorToken := strconv.FormatInt(params.AnchorMessage.Timestamp.UnixMilli(), 10)
